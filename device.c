@@ -137,7 +137,6 @@ device_write(struct device *device,
 	     uint64_t off,
 	     uint64_t len)
 {
-	    void *aligned_buf;
 
 	assert( !len || buf );
 	assert( 0 == (off % device->block) );
