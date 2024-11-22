@@ -65,7 +65,6 @@ static void *worker_thread(void *arg) {
         
         
         assert(fs->tail <= fs->head);
-        assert(0 <= (fs->tail % fs->block));
         assert(fs->capacity >= fs->head);
         
         
