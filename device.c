@@ -1,6 +1,6 @@
 /**
  * Tony Givargis
- * Copyright (C), 2023
+ * Copyright (C), 2023-2024
  * University of California, Irvine
  *
  * CS 238P - Operating Systems
@@ -13,9 +13,9 @@
 #include <sys/types.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <linux/fs.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <linux/fs.h> 
 #include "device.h"
 
 /**
@@ -119,19 +119,12 @@ device_close(struct device *device)
 int
 device_read(struct device *device, void *buf, uint64_t off, uint64_t len)
 {
-	void *aligned_buf;
 	assert( !len || buf );
 	assert( 0 == (off % device->block) );
 	assert( 0 == (len % device->block) );
 	assert( (off + len) <= device->size );
-	
-    if (posix_memalign(&aligned_buf, device->block, len)) {
-        TRACE("Memory alignment failed");
-        return -1;
-    }
 
-
-	if (len != (uint64_t)pread(device->fd, aligned_buf, (size_t)len, (off_t)off)) {
+	if (len != (uint64_t)pread(device->fd, buf, (size_t)len, (off_t)off)) {
 		TRACE("pread()");
 		return -1;
 	}
