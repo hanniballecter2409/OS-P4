@@ -56,6 +56,7 @@ struct logfs {
 static void *worker_thread(void *arg) {
     struct logfs *fs = (struct logfs *)arg;
     size_t size;
+    void* src;
     
     pthread_mutex_lock(&fs->lock);
     
@@ -74,7 +75,7 @@ static void *worker_thread(void *arg) {
         }
         
         
-        void *src = (char *)fs->buffer + (fs->tail % fs->BS);
+        src = (char *)fs->buffer + (fs->tail % fs->BS);
         if (device_write(fs->dev, src, fs->tail, fs->block)) {
             continue;
         }
@@ -91,6 +92,7 @@ static void *worker_thread(void *arg) {
 
 struct logfs *logfs_open(const char *pathname) {
     struct logfs *fs;
+    void *raw_buffer;
     
     if (!(fs = calloc(1, sizeof(struct logfs)))) {
         return NULL;
@@ -105,7 +107,7 @@ struct logfs *logfs_open(const char *pathname) {
     fs->capacity = device_size(fs->dev);
     fs->BS = fs->block * WCACHE_BLOCKS;  
     
-    void *raw_buffer = malloc(fs->BS + fs->block); 
+    raw_buffer = malloc(fs->BS + fs->block); 
     if (!raw_buffer) {
         device_close(fs->dev);
         FREE(fs);
@@ -161,24 +163,42 @@ void logfs_close(struct logfs *fs) {
 }
 
 int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
+
+    uint64_t start_block;
+    uint64_t end_block;
+    uint64_t block_count;
+
+    size_t start_offset;
+    size_t end_offset;
+
+    size_t copy_start ;
+    size_t copy_end ;
+    size_t copy_size ;
+    size_t buf_offset;
+
+    uint64_t current_block;
+    uint64_t cache_index ;
+    struct cache_block *cache;
+    size_t buffer_offset;
+
     if (!fs || (!buf && len) || (off + len) > fs->capacity) {
         return -1;
     }
 
-    uint64_t start_block = off / fs->block;
-    uint64_t end_block = (off + len + fs->block - 1) / fs->block;
-    uint64_t block_count = end_block - start_block;
+     start_block = off / fs->block;
+     end_block = (off + len + fs->block - 1) / fs->block;
+     block_count = end_block - start_block;
     
-    size_t start_offset = off % fs->block;
-    size_t end_offset = (off + len) % fs->block;
+     start_offset = off % fs->block;
+     end_offset = (off + len) % fs->block;
     if (end_offset == 0) end_offset = fs->block;
 
     pthread_mutex_lock(&fs->lock);
 
     for (uint64_t i = 0; i < block_count; i++) {
-        uint64_t current_block = start_block + i;
-        uint64_t cache_index = current_block % RCACHE_BLOCKS;
-        struct cache_block *cache = &fs->read_cache[cache_index];
+         current_block = start_block + i;
+         cache_index = current_block % RCACHE_BLOCKS;
+         cache = &fs->read_cache[cache_index];
         
         if (!cache->valid || cache->tag != current_block) {
             if (!cache->data) {
@@ -192,7 +212,7 @@ int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
             int found_in_buffer = 0;
             if (current_block * fs->block >= fs->tail && 
                 current_block * fs->block < fs->head) {
-                size_t buffer_offset = (current_block * fs->block - fs->tail) % fs->BS;
+                 buffer_offset = (current_block * fs->block - fs->tail) % fs->BS;
                 memcpy(cache->data, 
                        (char *)fs->buffer + buffer_offset, 
                        fs->block);
@@ -213,10 +233,10 @@ int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
             cache->valid = 1;
         }
         
-        size_t copy_start = (i == 0) ? start_offset : 0;
-        size_t copy_end = (i == block_count - 1) ? end_offset : fs->block;
-        size_t copy_size = copy_end - copy_start;
-        size_t buf_offset = (i == 0) ? 0 : (i * fs->block - start_offset);
+         copy_start = (i == 0) ? start_offset : 0;
+         copy_end = (i == block_count - 1) ? end_offset : fs->block;
+         copy_size = copy_end - copy_start;
+         buf_offset = (i == 0) ? 0 : (i * fs->block - start_offset);
         
         memcpy((char *)buf + buf_offset,
                cache->data + copy_start,
@@ -228,6 +248,12 @@ int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
 }
 
 int logfs_append(struct logfs *fs, const void *buf, uint64_t len) {
+
+    size_t available;
+    size_t write_size;
+    size_t buffer_pos;
+
+        
     if (!fs || (!buf && len)) {
         return -1;
     }
@@ -239,9 +265,9 @@ int logfs_append(struct logfs *fs, const void *buf, uint64_t len) {
             pthread_cond_wait(&fs->space_avail, &fs->lock);
         }
         
-        size_t available = fs->BS - (fs->head - fs->tail);
-        size_t write_size = MIN(len, available);
-        size_t buffer_pos = fs->head % fs->BS;
+         available = fs->BS - (fs->head - fs->tail);
+         write_size = MIN(len, available);
+         buffer_pos = fs->head % fs->BS;
         
         memcpy((char *)fs->buffer + buffer_pos, buf, write_size);
         
