@@ -116,57 +116,40 @@ device_close(struct device *device)
 	FREE(device);
 }
 
-int device_read(struct device *device, void *buf, uint64_t off, uint64_t len) {
-    void *aligned_buf;
-    int result = -1;
-    
-    assert(!len || buf);
-    assert(0 == (off % device->block));
-    assert(0 == (len % device->block));
-    assert((off + len) <= device->size);
+int
+device_read(struct device *device, void *buf, uint64_t off, uint64_t len)
+{
+	assert( !len || buf );
+	assert( 0 == (off % device->block) );
+	assert( 0 == (len % device->block) );
+	assert( (off + len) <= device->size );
 
-    aligned_buf = aligned_alloc_wrapper(device->block, len);
-    if (!aligned_buf) {
-        TRACE("aligned allocation failed");
-        return -1;
-    }
-
-    if (len == (uint64_t)pread(device->fd, aligned_buf, (size_t)len, (off_t)off)) {
-        memcpy(buf, aligned_buf, len);
-        result = 0;
-    } else {
-        TRACE("pread()");
-    }
-
-    free(aligned_buf);
-    return result;
+	if (len != (uint64_t)pread(device->fd, buf, (size_t)len, (off_t)off)) {
+		TRACE("pread()");
+		return -1;
+	}
+	return 0;
 }
 
-int device_write(struct device *device, const void *buf, uint64_t off, uint64_t len) {
-    void *aligned_buf;
-    int result = -1;
-    
-    assert(!len || buf);
-    assert(0 == (off % device->block));
-    assert(0 == (len % device->block));
-    assert((off + len) <= device->size);
+int
+device_write(struct device *device,
+	     const void *buf,
+	     uint64_t off,
+	     uint64_t len)
+{
+	assert( !len || buf );
+	assert( 0 == (off % device->block) );
+	assert( 0 == (len % device->block) );
+	assert( (off + len) <= device->size );
 
-    aligned_buf = aligned_alloc_wrapper(device->block, len);
-    if (!aligned_buf) {
-        TRACE("aligned allocation failed");
-        return -1;
-    }
-
-    memcpy(aligned_buf, buf, len);
-
-    if (len == (uint64_t)pwrite(device->fd, aligned_buf, (size_t)len, (off_t)off)) {
-        result = 0;
-    } else {
-        TRACE("pwrite()");
-    }
-
-    free(aligned_buf);
-    return result;
+	if (len != (uint64_t)pwrite(device->fd,
+				    buf,
+				    (size_t)len,
+				    (off_t)off)) {
+		TRACE("pwrite()");
+		return -1;
+	}
+	return 0;
 }
 
 uint64_t
