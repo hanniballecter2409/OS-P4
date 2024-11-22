@@ -167,6 +167,7 @@ int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
     uint64_t start_block;
     uint64_t end_block;
     uint64_t block_count;
+    uint64_t i;
 
     size_t start_offset;
     size_t end_offset;
@@ -195,7 +196,7 @@ int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
 
     pthread_mutex_lock(&fs->lock);
 
-    for (uint64_t i = 0; i < block_count; i++) {
+    for ( i = 0; i < block_count; i++) {
          current_block = start_block + i;
          cache_index = current_block % RCACHE_BLOCKS;
          cache = &fs->read_cache[cache_index];
