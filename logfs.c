@@ -180,7 +180,7 @@ int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
     uint64_t current_block;
     uint64_t cache_index ;
     struct cache_block *cache;
-    size_t buffer_offset;
+    size_t buf_offset;
 
     if (!fs || (!buf && len) || (off + len) > fs->capacity) {
         return -1;
