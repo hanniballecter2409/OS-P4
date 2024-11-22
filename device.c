@@ -137,13 +137,23 @@ device_write(struct device *device,
 	     uint64_t off,
 	     uint64_t len)
 {
+	    void *aligned_buf;
+
 	assert( !len || buf );
 	assert( 0 == (off % device->block) );
 	assert( 0 == (len % device->block) );
 	assert( (off + len) <= device->size );
 
+	aligned_buf = aligned_alloc_wrapper(device->block, len);
+    if (!aligned_buf) {
+        TRACE("aligned allocation failed");
+        return -1;
+    }
+
+	memcpy(aligned_buf, buf, len);
+
 	if (len != (uint64_t)pwrite(device->fd,
-				    buf,
+				    aligned_buf,
 				    (size_t)len,
 				    (off_t)off)) {
 		TRACE("pwrite()");
