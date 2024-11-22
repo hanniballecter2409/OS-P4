@@ -131,7 +131,7 @@ device_read(struct device *device, void *buf, uint64_t off, uint64_t len)
     }
 
 
-	if (len != (uint64_t)pread(device->fd, baligned_buf, (size_t)len, (off_t)off)) {
+	if (len != (uint64_t)pread(device->fd, aligned_buf, (size_t)len, (off_t)off)) {
 		TRACE("pread()");
 		return -1;
 	}
