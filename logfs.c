@@ -210,26 +210,13 @@ int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
                 }
             }
             
-            int found_in_buffer = 0;
-            if (current_block * fs->block >= fs->tail && 
-                current_block * fs->block < fs->head) {
-                 buffer_offset = (current_block * fs->block - fs->tail) % fs->BS;
-                memcpy(cache->data, 
-                       (char *)fs->buffer + buffer_offset, 
-                       fs->block);
-                found_in_buffer = 1;
-            }
-            
-            if (!found_in_buffer) {
-                if (device_read(fs->dev, 
+            if (device_read(fs->dev, 
                               cache->data, 
                               current_block * fs->block, 
                               fs->block)) {
                     pthread_mutex_unlock(&fs->lock);
                     return -1;
                 }
-            }
-            
             cache->tag = current_block;  
             cache->valid = 1;
         }
