@@ -11,7 +11,7 @@
 #include "device.h"
 #include "logfs.h"
 
-#define WCACHE_BLOCKS 32
+#define WCACHE_BLOCKS 33
 #define RCACHE_BLOCKS 256
 
 /**
@@ -30,244 +30,501 @@
 
 /* research the above Needed API and design accordingly */
 
-struct cache_block {
-    char *data;         
-    uint64_t tag;       
-    short valid;
+struct queue {
+    char *data;
+    uint64_t head, tail;
+    uint64_t capacity;
+    uint64_t utilized;
 };
 
+struct worker {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int stop_thread;
+    int force_write;
+};
+
+struct cache_block {
+    char *data;
+    uint64_t offset;
+    short valid;
+    uint64_t idx;
+};
 
 struct logfs {
-    struct device *dev;         
-    void *buffer;             
-    size_t head;              
-    size_t tail;              
-    size_t BS;                
-    size_t block;             
-    size_t capacity;          
-    pthread_t worker;         
-    pthread_mutex_t lock;     
-    pthread_cond_t data_avail;
-    pthread_cond_t space_avail; 
-    int done;          
+    struct device *device;
+    uint64_t utilized;
+    uint64_t capacity;
+    struct queue *write_queue;
+    struct worker *worker;
     struct cache_block read_cache[RCACHE_BLOCKS];
 };
 
-static void *worker_thread(void *arg) {
-    struct logfs *fs = (struct logfs *)arg;
-    size_t size;
-    void* src;
-    
-    pthread_mutex_lock(&fs->lock);
-    
-    while (!fs->done) {
-        
-        size = fs->head - fs->tail;
-        
-        
-        assert(fs->tail <= fs->head);
-        assert(fs->capacity >= fs->head);
-        
-        
-        if (size < fs->block) {
-            pthread_cond_wait(&fs->data_avail, &fs->lock);
-            continue;
+struct logfs_metadata {
+    uint64_t utilized;
+};
+
+uint64_t normalize_block(struct logfs *logfs, uint64_t i) {
+    return i / device_block(logfs->device) * device_block(logfs->device);
+}
+
+void mark_cache_invalid(struct logfs *logfs, uint64_t offset) {
+    int i;
+    for (i = 0; i < RCACHE_BLOCKS; i++) {
+        if (logfs->read_cache[i].valid && logfs->read_cache[i].offset == offset) {
+            logfs->read_cache[i].valid = 0;
         }
-        
-        
-        src = (char *)fs->buffer + (fs->tail % fs->BS);
-        if (device_write(fs->dev, src, fs->tail, fs->block)) {
-            continue;
-        }
-        
-        fs->tail += fs->block;
-        size -= fs->block;
-        
-        pthread_cond_signal(&fs->space_avail);
     }
-    
-    pthread_mutex_unlock(&fs->lock);
-    return NULL;
+}
+
+void write_to_disk(struct logfs *logfs) {
+    char *buf = logfs->write_queue->data + logfs->write_queue->head;
+    uint64_t normalized_tail = normalize_block(logfs, logfs->write_queue->tail);
+    uint64_t normalized_utilized = normalize_block(logfs, logfs->utilized);
+    uint64_t normalized_device_offset = normalized_utilized + RESTORE_FROM_FILE * device_block(logfs->device);
+    uint64_t to_write, utilized, i;
+
+    if (logfs->write_queue->head == normalized_tail) {
+        if (device_write(logfs->device, buf, normalized_device_offset, device_block(logfs->device))) {
+            TRACE("device_write()");
+            return;
+        }
+
+        mark_cache_invalid(logfs, normalized_utilized);
+        logfs->utilized += logfs->write_queue->utilized;
+        logfs->write_queue->utilized = 0;
+    } else {
+        if (logfs->write_queue->head < normalized_tail) {
+            if (logfs->write_queue->tail == normalized_tail) {
+                to_write = logfs->write_queue->tail - logfs->write_queue->head;
+            } else {
+                to_write = normalized_tail + device_block(logfs->device) - logfs->write_queue->head;
+            }
+            utilized = logfs->write_queue->utilized;
+            logfs->write_queue->head = normalized_tail % logfs->write_queue->capacity;
+        } else {
+            to_write = logfs->write_queue->capacity - logfs->write_queue->head;
+            utilized = logfs->write_queue->capacity - logfs->write_queue->head;
+            logfs->write_queue->head = 0;
+        }
+
+        if (device_write(logfs->device, buf, normalized_device_offset, to_write)) {
+            TRACE("device_write()");
+            return;
+        }
+
+        for (i = 0; i < to_write / device_block(logfs->device); i++) {
+            mark_cache_invalid(logfs, normalized_utilized + i * device_block(logfs->device));
+        }
+        logfs->utilized += utilized;
+        logfs->write_queue->utilized -= utilized;
+    }
+}
+
+void *worker(void *arg) {
+    struct logfs *logfs = arg;
+
+    while (1) {
+        if (pthread_mutex_lock(&logfs->worker->mutex)) {
+            TRACE("pthread_mutex_lock()");
+            return NULL;
+        }
+
+        while (logfs->write_queue->utilized == 0 && !logfs->worker->stop_thread) {
+            if (pthread_cond_wait(&logfs->worker->cond, &logfs->worker->mutex)) {
+                TRACE("pthread_cond_wait()");
+                return NULL;
+            }
+        }
+
+        if (logfs->write_queue->utilized >= device_block(logfs->device) || logfs->worker->force_write) {
+            write_to_disk(logfs);
+
+            logfs->worker->force_write = 0;
+
+            if (pthread_cond_signal(&logfs->worker->cond)) {
+                TRACE("pthread_cond_signal()");
+                return NULL;
+            }
+        }
+
+        if (pthread_mutex_unlock(&logfs->worker->mutex)) {
+            TRACE("pthread_mutex_unlock()");
+            return NULL;
+        }
+
+        if (logfs->worker->stop_thread) {
+            return NULL;
+        }
+    }
+}
+
+uint64_t get_metadata(struct logfs *logfs) {
+    uint64_t utilized;
+
+    char *metadata = malloc(device_block(logfs->device));
+    if (!metadata) {
+        TRACE("out of memory");
+        return -1;
+    }
+
+    if (device_read(logfs->device, metadata, 0, device_block(logfs->device))) {
+        TRACE("device_read()");
+        free(metadata);
+        return -1;
+    }
+
+    utilized = ((struct logfs_metadata *) metadata)->utilized;
+
+    free(metadata);
+
+    return utilized;
+}
+
+void set_metadata(struct logfs *logfs, uint64_t utilized) {
+    char *metadata = malloc(device_block(logfs->device));
+    if (!metadata) {
+        TRACE("out of memory");
+        return;
+    }
+
+    ((struct logfs_metadata *) metadata)->utilized = utilized;
+
+    if (device_write(logfs->device, metadata, 0, device_block(logfs->device))) {
+        TRACE("device_write()");
+        free(metadata);
+        return;
+    }
+
+    free(metadata);
+}
+
+int setup_device(struct logfs *logfs, const char *pathname) {
+    if (!(logfs->device = device_open(pathname))) {
+        return -1;
+    }
+
+    logfs->capacity = device_size(logfs->device);
+    logfs->utilized = RESTORE_FROM_FILE * get_metadata(logfs);
+
+    return 0;
+}
+
+int setup_queue(struct logfs *logfs) {
+    if (!(logfs->write_queue = malloc(sizeof(struct queue)))) {
+        return -1;
+    }
+    memset(logfs->write_queue, 0, sizeof(struct queue));
+
+    logfs->write_queue->head = 0;
+    logfs->write_queue->tail = 0;
+    logfs->write_queue->capacity = device_block(logfs->device) * WCACHE_BLOCKS;
+    logfs->write_queue->utilized = 0;
+
+    if (!(logfs->write_queue->data = malloc(logfs->write_queue->capacity))) {
+        return -1;
+    }
+    memset(logfs->write_queue->data, 0, logfs->write_queue->capacity);
+
+    return 0;
+}
+
+int setup_cache(struct logfs *logfs) {
+    int i;
+
+    for (i = 0; i < RCACHE_BLOCKS; i++) {
+        if (!(logfs->read_cache[i].data = malloc(device_block(logfs->device)))) {
+            return -1;
+        }
+        memset(logfs->read_cache[i].data, 0, device_block(logfs->device));
+
+        logfs->read_cache[i].valid = 0;
+        logfs->read_cache[i].idx = i;
+    }
+
+    return 0;
+}
+
+int setup_worker(struct logfs *logfs) {
+    if (!(logfs->worker = malloc(sizeof(struct worker)))) {
+        return -1;
+    }
+    memset(logfs->worker, 0, sizeof(struct worker));
+
+    if (pthread_mutex_init(&logfs->worker->mutex, NULL) ||
+        pthread_cond_init(&logfs->worker->cond, NULL) ||
+        pthread_create(&logfs->worker->thread, NULL, worker, logfs)) {
+        return -1;
+    }
+
+    return 0;
 }
 
 struct logfs *logfs_open(const char *pathname) {
-    struct logfs *fs;
-    void *raw_buffer;
-    
-    if (!(fs = calloc(1, sizeof(struct logfs)))) {
+    struct logfs *logfs;
+
+    assert(safe_strlen(pathname));
+
+    if (!(logfs = malloc(sizeof(struct logfs)))) {
+        TRACE("out of memory");
         return NULL;
     }
-    
-    if (!(fs->dev = device_open(pathname))) {
-        FREE(fs);
+    memset(logfs, 0, sizeof(struct logfs));
+
+    if (setup_device(logfs, pathname) || setup_queue(logfs) || setup_cache(logfs) || setup_worker(logfs)) {
+        logfs_close(logfs);
+        TRACE(0);
         return NULL;
     }
-    
-    fs->block = device_block(fs->dev);
-    fs->capacity = device_size(fs->dev);
-    fs->BS = fs->block * WCACHE_BLOCKS;  
-    
-    raw_buffer = malloc(fs->BS + fs->block); 
-    if (!raw_buffer) {
-        device_close(fs->dev);
-        FREE(fs);
-        return NULL;
-    }
-    fs->buffer = memory_align(raw_buffer, fs->block);
-    
-   
-    if (pthread_mutex_init(&fs->lock, NULL) ||
-        pthread_cond_init(&fs->data_avail, NULL) ||
-        pthread_cond_init(&fs->space_avail, NULL)) {
-        FREE(raw_buffer);
-        device_close(fs->dev);
-        FREE(fs);
-        return NULL;
-    }
-    
-    fs->head = 0;
-    fs->tail = 0;
-    fs->done = 0;
-    
-    if (pthread_create(&fs->worker, NULL, worker_thread, fs)) {
-        pthread_mutex_destroy(&fs->lock);
-        pthread_cond_destroy(&fs->data_avail);
-        pthread_cond_destroy(&fs->space_avail);
-        FREE(raw_buffer);
-        device_close(fs->dev);
-        FREE(fs);
-        return NULL;
-    }
-    
-    return fs;
+
+    return logfs;
 }
 
-void logfs_close(struct logfs *fs) {
-    if (!fs) {
-        return;
+void logfs_close(struct logfs *logfs) {
+    int i;
+
+    assert(logfs);
+
+    if (RESTORE_FROM_FILE) {
+        set_metadata(logfs, logfs->utilized);
     }
-    
-    pthread_mutex_lock(&fs->lock);
-    fs->done = 1;
-    pthread_cond_signal(&fs->data_avail);
-    pthread_mutex_unlock(&fs->lock);
-    
-    pthread_join(fs->worker, NULL);
-    
-    pthread_mutex_destroy(&fs->lock);
-    pthread_cond_destroy(&fs->data_avail);
-    pthread_cond_destroy(&fs->space_avail);
-    FREE(fs->buffer);
-    device_close(fs->dev);
-    FREE(fs);
+
+    if (logfs) {
+        if (logfs->worker) {
+            if (pthread_mutex_lock(&logfs->worker->mutex)) {
+                TRACE("pthread_mutex_lock()");
+            }
+            logfs->worker->stop_thread = 1;
+            if (pthread_cond_signal(&logfs->worker->cond)) {
+                TRACE("pthread_cond_signal()");
+            }
+            if (pthread_mutex_unlock(&logfs->worker->mutex)) {
+                TRACE("pthread_mutex_unlock()");
+            }
+            if (pthread_join(logfs->worker->thread, NULL)) {
+                TRACE("pthread_join()");
+            }
+            if (pthread_mutex_destroy(&logfs->worker->mutex)) {
+                TRACE("pthread_mutex_destroy()");
+            }
+            if (pthread_cond_destroy(&logfs->worker->cond)) {
+                TRACE("pthread_cond_destroy()");
+            }
+        }
+        if (logfs->write_queue) {
+            FREE(logfs->write_queue->data);
+            FREE(logfs->write_queue);
+        }
+        for (i = 0; i < RCACHE_BLOCKS; ++i) {
+            if (logfs->read_cache[i].data) {
+                FREE(logfs->read_cache[i].data);
+            }
+        }
+        if (logfs->worker) {
+            FREE(logfs->worker);
+        }
+        if (logfs->write_queue) {
+            FREE(logfs->write_queue);
+        }
+        if (logfs->device) {
+            device_close(logfs->device);
+        }
+        memset(logfs, 0, sizeof(struct logfs));
+    }
+    FREE(logfs);
 }
 
-int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
+int get_from_cache(struct logfs *logfs, void *buf, uint64_t block_offset, uint64_t data_offset, uint64_t to_read) {
+    int i;
+    for (i = 0; i < RCACHE_BLOCKS; i++) {
+        if (logfs->read_cache[i].valid &&
+            logfs->read_cache[i].offset == block_offset - RESTORE_FROM_FILE * device_block(logfs->device)) {
+            memcpy(buf, logfs->read_cache[i].data + data_offset, to_read);
+            return 0;
+        }
+    }
+    return -1;
+}
 
-    uint64_t start_block;
-    uint64_t end_block;
-    uint64_t block_count;
-    uint64_t i;
+int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len) {
+    uint64_t written, start_block_offset, end_block_offset;
+    int num_blocks, i;
+    char *result;
 
-    size_t start_offset;
-    size_t end_offset;
-
-    size_t copy_start ;
-    size_t copy_end ;
-    size_t copy_size ;
-    size_t buf_offset;
-
-    uint64_t current_block;
-    uint64_t cache_index ;
-    struct cache_block *cache;
-
-    if (!fs || (!buf && len) || (off + len) > fs->capacity) {
-        return -1;
+    if (!buf || !len) {
+        return 0;
     }
 
-     start_block = off / fs->block;
-     end_block = (off + len + fs->block - 1) / fs->block;
-     block_count = end_block - start_block;
-    
-     start_offset = off % fs->block;
-     end_offset = (off + len) % fs->block;
-    if (end_offset == 0) end_offset = fs->block;
+    off += RESTORE_FROM_FILE * device_block(logfs->device);
 
-    pthread_mutex_lock(&fs->lock);
+    while (1) {
+        if (pthread_mutex_lock(&logfs->worker->mutex)) {
+            TRACE("pthread_mutex_lock()");
+            return -1;
+        }
 
-    for ( i = 0; i < block_count; i++) {
-         current_block = start_block + i;
-         cache_index = current_block % RCACHE_BLOCKS;
-         cache = &fs->read_cache[cache_index];
-        
-        if (!cache->valid || cache->tag != current_block) {
-            if (!cache->data) {
-                cache->data = malloc(fs->block);
-                if (!cache->data) {
-                    pthread_mutex_unlock(&fs->lock);
-                    return -1;
+        while (logfs->write_queue->utilized > 0) {
+            if (logfs->write_queue->utilized < device_block(logfs->device)) {
+                logfs->worker->force_write = 1;
+            }
+            if (pthread_cond_wait(&logfs->worker->cond, &logfs->worker->mutex)) {
+                TRACE("pthread_cond_wait()");
+                return -1;
+            }
+        }
+
+        if (logfs->write_queue->utilized == 0) {
+            if (pthread_cond_signal(&logfs->worker->cond)) {
+                TRACE("pthread_cond_signal()");
+                return -1;
+            }
+            if (pthread_mutex_unlock(&logfs->worker->mutex)) {
+                TRACE("pthread_mutex_unlock()");
+                return -1;
+            }
+            break;
+        }
+
+
+        if (pthread_mutex_unlock(&logfs->worker->mutex)) {
+            TRACE("pthread_mutex_unlock()");
+            return -1;
+        }
+    }
+
+    written = 0;
+    start_block_offset = normalize_block(logfs, off);
+    end_block_offset = normalize_block(logfs, off + len);
+    num_blocks = (int) ((end_block_offset - start_block_offset) / device_block(logfs->device)) + 1;
+
+    result = malloc(len);
+
+    for (i = 0; i < num_blocks; i++) {
+        uint64_t block_offset = start_block_offset + i * device_block(logfs->device);
+        uint64_t data_offset, to_read;
+
+        if (i == 0) {
+            data_offset = off - start_block_offset;
+            to_read = MIN(device_block(logfs->device) - data_offset, len);
+        } else if (i == num_blocks - 1) {
+            data_offset = 0;
+            to_read = off + len - end_block_offset;
+        } else {
+            data_offset = 0;
+            to_read = device_block(logfs->device);
+        }
+
+        if (get_from_cache(logfs, result + written, block_offset, data_offset, to_read) != 0) {
+            int min_idx = 0, max_idx = 0, j;
+            char *data;
+
+            for (j = 0; j < RCACHE_BLOCKS; j++) {
+                if (logfs->read_cache[j].idx < logfs->read_cache[min_idx].idx) {
+                    min_idx = j;
+                }
+                if (logfs->read_cache[j].idx > logfs->read_cache[max_idx].idx) {
+                    max_idx = j;
                 }
             }
-            
-            if (device_read(fs->dev, 
-                              cache->data, 
-                              current_block * fs->block, 
-                              fs->block)) {
-                    pthread_mutex_unlock(&fs->lock);
-                    return -1;
-                }
-            cache->tag = current_block;  
-            cache->valid = 1;
+
+            data = malloc(device_block(logfs->device));
+            if (!data) {
+                TRACE("out of memory");
+                return -1;
+            }
+
+            if (device_read(logfs->device, data, block_offset, device_block(logfs->device))) {
+                TRACE("device_read()");
+                return -1;
+            }
+
+            memcpy(logfs->read_cache[min_idx].data, data, device_block(logfs->device));
+            logfs->read_cache[min_idx].offset = block_offset - RESTORE_FROM_FILE * device_block(logfs->device);
+            logfs->read_cache[min_idx].valid = 1;
+            logfs->read_cache[min_idx].idx = logfs->read_cache[max_idx].idx + 1;
+
+            free(data);
+
+            memcpy(result + written, logfs->read_cache[min_idx].data + data_offset, to_read);
         }
-        
-         copy_start = (i == 0) ? start_offset : 0;
-         copy_end = (i == block_count - 1) ? end_offset : fs->block;
-         copy_size = copy_end - copy_start;
-         buf_offset = (i == 0) ? 0 : (i * fs->block - start_offset);
-        
-        memcpy((char *)buf + buf_offset,
-               cache->data + copy_start,
-               copy_size);
+
+        written += to_read;
     }
-    
-    pthread_mutex_unlock(&fs->lock);
+
+    memcpy(buf, result, len);
+
+    free(result);
+
     return 0;
 }
 
-int logfs_append(struct logfs *fs, const void *buf, uint64_t len) {
+void queue_add(struct logfs *logfs, const void *buf, uint64_t len) {
+    if (logfs->write_queue->tail + len <= logfs->write_queue->capacity) {
+        memcpy(logfs->write_queue->data + logfs->write_queue->tail, buf, len);
+        logfs->write_queue->tail += len;
+    } else {
+        uint64_t space_at_end = logfs->write_queue->capacity - logfs->write_queue->tail;
+        uint64_t leftover = len - space_at_end;
+        if (space_at_end) {
+            memcpy(logfs->write_queue->data + logfs->write_queue->tail, buf, space_at_end);
+        }
+        if (leftover) {
+            memcpy(logfs->write_queue->data, (char *) buf + space_at_end, leftover);
+        }
+        logfs->write_queue->tail = leftover % logfs->write_queue->capacity;
+    }
 
-    size_t available;
-    size_t write_size;
-    size_t buffer_pos;
+    logfs->write_queue->utilized += len;
+}
 
-        
-    if (!fs || (!buf && len)) {
+int logfs_append(struct logfs *logfs, const void *buf, uint64_t len) {
+    assert(logfs);
+    assert(buf || !len);
+
+    if (logfs->utilized + len > logfs->capacity) {
+        TRACE("out of space");
         return -1;
     }
-    
-    pthread_mutex_lock(&fs->lock);
-    
-    while (len > 0) {
-        while ((fs->head - fs->tail) >= fs->BS) {
-            pthread_cond_wait(&fs->space_avail, &fs->lock);
+
+    while (1) {
+        if (pthread_mutex_lock(&logfs->worker->mutex)) {
+            TRACE("pthread_mutex_lock()");
+            return -1;
         }
-        
-         available = fs->BS - (fs->head - fs->tail);
-         write_size = MIN(len, available);
-         buffer_pos = fs->head % fs->BS;
-        
-        memcpy((char *)fs->buffer + buffer_pos, buf, write_size);
-        
-        fs->head += write_size;
-        buf = (const char *)buf + write_size;
-        len -= write_size;
-        
-        assert(fs->tail <= fs->head);
-        assert(fs->capacity >= fs->head);
-        
-        pthread_cond_signal(&fs->data_avail);
+
+        while (logfs->write_queue->utilized + len > logfs->write_queue->capacity) {
+            if (pthread_cond_wait(&logfs->worker->cond, &logfs->worker->mutex)) {
+                TRACE("pthread_cond_wait()");
+                return -1;
+            }
+        }
+
+        if (logfs->write_queue->utilized + len <= logfs->write_queue->capacity) {
+            queue_add(logfs, buf, len);
+
+            if (pthread_cond_signal(&logfs->worker->cond)) {
+                TRACE("pthread_cond_signal()");
+                return -1;
+            }
+            if (pthread_mutex_unlock(&logfs->worker->mutex)) {
+                TRACE("pthread_mutex_unlock()");
+                return -1;
+            }
+            return 0;
+        }
+
+        if (pthread_mutex_unlock(&logfs->worker->mutex)) {
+            TRACE("pthread_mutex_unlock()");
+            return -1;
+        }
     }
-    
-    pthread_mutex_unlock(&fs->lock);
+
     return 0;
+}
+
+uint64_t logfs_size(struct logfs *logfs) {
+    assert(logfs);
+
+    return logfs->utilized;
 }
