@@ -30,6 +30,12 @@
 
 /* research the above Needed API and design accordingly */
 
+struct cache_block {
+    char *data;         
+    uint64_t tag;       
+    short valid;
+};
+
 
 struct logfs {
     struct device *dev;         // Block device handle
@@ -44,6 +50,7 @@ struct logfs {
     pthread_cond_t data_avail; // Condition for data availability
     pthread_cond_t space_avail; // Condition for space availability
     int done;                 // Flag to mark completion
+    struct cache_block read_cache[RCACHE_BLOCKS];
 };
 
 static void *worker_thread(void *arg) {
@@ -166,79 +173,78 @@ void logfs_close(struct logfs *fs) {
 }
 
 int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
-    if (!fs || !buf || len == 0) {
+    if (!fs || (!buf && len) || (off + len) > fs->capacity) {
         return -1;
     }
-    
-    pthread_mutex_lock(&fs->lock);
-    
-    // Verify offset is within written range
-    if (off >= fs->head) {
-        pthread_mutex_unlock(&fs->lock);
-        return -1;
-    }
-    
-    // Read from device
-    if (device_read(fs->dev, buf, off, len)) {
-        pthread_mutex_unlock(&fs->lock);
-        return -1;
-    }
-    
-    pthread_mutex_unlock(&fs->lock);
-    return 0;
-}
 
-int logfs_read(struct logfs *fs, void *buf, uint64_t off, size_t len) {
-    if (!fs || !buf || len == 0 || off >= fs->capacity) {
-        return -1;
-    }
+    // Align read request to block boundaries
+    uint64_t start_block = off / fs->block;
+    uint64_t end_block = (off + len + fs->block - 1) / fs->block;
+    uint64_t block_count = end_block - start_block;
+    
+    // Calculate offsets within blocks
+    size_t start_offset = off % fs->block;
+    size_t end_offset = (off + len) % fs->block;
+    if (end_offset == 0) end_offset = fs->block;
 
     pthread_mutex_lock(&fs->lock);
 
-    size_t block_size = fs->block_size;
-    size_t blocks_to_read = (len + block_size - 1) / block_size; // Round up to nearest block
-    uint64_t start_block = off / block_size;
-    uint64_t end_block = start_block + blocks_to_read;
-
-    for (uint64_t block = start_block; block < end_block; block++) {
-        // Check if block is in cache
-        int cache_index = block % fs->rblocks; // Cache index (modulo buffer size)
-        struct cache_block *meta = &fs->rmeta[cache_index];
-        void *cache_data = (char *)fs->rbuffer + cache_index * block_size;
-
-        if (meta->valid && meta->tag == block) {
-            // Cache hit: copy data from cache
-            size_t offset_in_block = (block == start_block) ? off % block_size : 0;
-            size_t bytes_to_copy = (block == end_block - 1) 
-                                   ? (off + len) % block_size 
-                                   : block_size - offset_in_block;
-
-            memcpy(buf, (char *)cache_data + offset_in_block, bytes_to_copy);
-            buf = (char *)buf + bytes_to_copy;
-            len -= bytes_to_copy;
-        } else {
-            // Cache miss: read block from device
-            if (device_read(fs->dev, cache_data, block * block_size, block_size)) {
-                pthread_mutex_unlock(&fs->lock);
-                return -1; // Device read error
+    // Process each block
+    for (uint64_t i = 0; i < block_count; i++) {
+        uint64_t current_block = start_block + i;
+        uint64_t cache_index = current_block % RCACHE_BLOCKS;
+        struct cache_block *cache = &fs->read_cache[cache_index];
+        
+        // Check cache hit/miss using tag comparison
+        if (!cache->valid || cache->tag != current_block) {
+            // Cache miss - allocate buffer if needed
+            if (!cache->data) {
+                cache->data = malloc(fs->block);
+                if (!cache->data) {
+                    pthread_mutex_unlock(&fs->lock);
+                    return -1;
+                }
             }
-
+            
+            // Check if block is in write buffer
+            int found_in_buffer = 0;
+            if (current_block * fs->block >= fs->tail && 
+                current_block * fs->block < fs->head) {
+                // Calculate position in circular buffer
+                size_t buffer_offset = (current_block * fs->block - fs->tail) % fs->BS;
+                memcpy(cache->data, 
+                       (char *)fs->buffer + buffer_offset, 
+                       fs->block);
+                found_in_buffer = 1;
+            }
+            
+            // If not in write buffer, read from device
+            if (!found_in_buffer) {
+                if (device_read(fs->dev, 
+                              cache->data, 
+                              current_block * fs->block, 
+                              fs->block)) {
+                    pthread_mutex_unlock(&fs->lock);
+                    return -1;
+                }
+            }
+            
             // Update cache metadata
-            meta->tag = block;
-            meta->valid = 1;
-
-            // Copy data from cache
-            size_t offset_in_block = (block == start_block) ? off % block_size : 0;
-            size_t bytes_to_copy = (block == end_block - 1) 
-                                   ? (off + len) % block_size 
-                                   : block_size - offset_in_block;
-
-            memcpy(buf, (char *)cache_data + offset_in_block, bytes_to_copy);
-            buf = (char *)buf + bytes_to_copy;
-            len -= bytes_to_copy;
+            cache->tag = current_block;  // Store block number instead of byte offset
+            cache->valid = 1;
         }
+        
+        // Copy data from cache to user buffer
+        size_t copy_start = (i == 0) ? start_offset : 0;
+        size_t copy_end = (i == block_count - 1) ? end_offset : fs->block;
+        size_t copy_size = copy_end - copy_start;
+        size_t buf_offset = (i == 0) ? 0 : (i * fs->block - start_offset);
+        
+        memcpy((char *)buf + buf_offset,
+               cache->data + copy_start,
+               copy_size);
     }
-
+    
     pthread_mutex_unlock(&fs->lock);
     return 0;
 }
