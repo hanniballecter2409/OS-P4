@@ -119,11 +119,12 @@ device_close(struct device *device)
 int
 device_read(struct device *device, void *buf, uint64_t off, uint64_t len)
 {
+	void *aligned_buf;
 	assert( !len || buf );
 	assert( 0 == (off % device->block) );
 	assert( 0 == (len % device->block) );
 	assert( (off + len) <= device->size );
-	void *aligned_buf;
+	
     if (posix_memalign(&aligned_buf, device->block, len)) {
         TRACE("Memory alignment failed");
         return -1;
