@@ -10,6 +10,8 @@
 #ifndef _SYSTEM_H_
 #define _SYSTEM_H_
 
+#define RESTORE_FROM_FILE 1
+
 #include <time.h>
 #include <errno.h>
 #include <ctype.h>
