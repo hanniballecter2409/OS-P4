@@ -123,8 +123,14 @@ device_read(struct device *device, void *buf, uint64_t off, uint64_t len)
 	assert( 0 == (off % device->block) );
 	assert( 0 == (len % device->block) );
 	assert( (off + len) <= device->size );
+	void *aligned_buf;
+    if (posix_memalign(&aligned_buf, device->block, len)) {
+        TRACE("Memory alignment failed");
+        return -1;
+    }
 
-	if (len != (uint64_t)pread(device->fd, buf, (size_t)len, (off_t)off)) {
+
+	if (len != (uint64_t)pread(device->fd, baligned_buf, (size_t)len, (off_t)off)) {
 		TRACE("pread()");
 		return -1;
 	}
